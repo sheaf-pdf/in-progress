@@ -1,76 +1,72 @@
 # in-progress
 
-Progress reporting and cancellation for long-running operations, in one small, dependency-free Rust crate.
+Progress reporting and cooperative cancellation for long-running operations, in one small Rust crate with no dependencies.
 
-An operation takes a `&dyn Progress`, says how far along it is, and calls `p.check()?` once per page or chunk so a cancel stops it cleanly. The caller decides what to do with the reports: a GUI can poll a snapshot every frame, a CLI can draw a bar, and a caller that doesn't care can pass `NoProgress`.
+An operation takes a `&dyn Progress`, says how far along it is, and calls `check()?` between units of work so a cancel stops it cleanly. Whoever runs it holds a `Tracker`: it polls a `Snapshot` from another thread to draw a progress bar or a status line, and can cancel at any time. Callers that don't care pass `NoProgress`.
+
+Steps nest. An operation hands each step a weighted child, and the step doesn't need to know where it sits in the whole job.
+
+## Example
+
+```rust
+use in_progress::{Cancelled, Progress, Tracker, Unit};
+use std::{thread, time::Duration};
+
+// Operations only see `&dyn Progress`.
+fn process(items: &[u32], progress: &dyn Progress) -> Result<u32, Cancelled> {
+    progress.set_total(Some(items.len() as u64), Unit::Count("records"));
+    let mut sum = 0;
+    for item in items {
+        progress.check()?;
+        thread::sleep(Duration::from_millis(5)); // Stand-in for real work.
+        sum += item;
+        progress.inc(1);
+    }
+    Ok(sum)
+}
+
+// A job made of steps gives each one a weighted share of its own.
+fn job(items: &[u32], progress: &dyn Progress) -> Result<u32, Cancelled> {
+    process(items, &progress.child("validate", 0.25))?;
+    process(items, &progress.child("sum", 0.75))
+}
+
+fn main() {
+    let tracker = Tracker::new();
+    let worker = thread::spawn({
+        let tracker = tracker.clone();
+        move || job(&[1, 2, 3], &tracker)
+    });
+    while !worker.is_finished() {
+        let s = tracker.snapshot();
+        let percent = s.fraction.unwrap_or(0.0) * 100.0;
+        println!("{percent:.0}% {}: {} {}", s.step, s.done, s.unit.noun());
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(worker.join().unwrap(), Ok(6));
+    assert_eq!(tracker.snapshot().fraction, Some(1.0));
+}
+```
+
+Calling `tracker.cancel()` from any thread stops the job: its next `check()` returns `Err(Cancelled)`.
+
+The [API documentation](https://docs.rs/in-progress) covers how shares add up, threads, and cancellation.
 
 ## Status
 
-Early (`0.1.0`), not yet published. The whole library is a single file, `src/lib.rs`, with unit tests. It has no dependencies and uses only `std`. The API may change.
-
-## Usage
-
-```rust
-use in_progress::{Cancelled, Level, NoProgress, Progress, Tracker, Unit};
-
-// An op only knows about `&dyn Progress`.
-fn ocr(pages: &[Page], p: &dyn Progress) -> Result<(), Cancelled> {
-    p.set_total(Some(pages.len() as u64), Unit::Pages);
-    for page in pages {
-        p.check()?; // stops here if someone cancelled
-        // ... do the work ...
-        p.inc(1);
-    }
-    Ok(())
-}
-
-// A job made of steps hands each step a weighted child. The step doesn't
-// need to know where it sits in the whole.
-fn job(pages: &[Page], p: &dyn Progress) -> Result<(), Cancelled> {
-    render(pages, &*p.child("render", 0.25))?;
-    ocr(pages, &*p.child("ocr", 0.75))
-}
-
-let tracker = Tracker::new();
-let handle = tracker.clone(); // clones share the same progress
-std::thread::spawn(move || job(&pages, &handle));
-
-// From a UI thread:
-let snap = tracker.snapshot(); // fraction, step, done/total/unit, message, cancelled
-tracker.cancel();              // from any thread
-```
-
-Callers that don't care about progress pass `&NoProgress`.
-
-## Concepts
-
-- **`Progress`** is the trait ops depend on: `set_total`, `set`, `inc`, `message`, `is_cancelled`, `check` and `child`.
-- **`Tracker`** is the shared implementation. It is cheap to clone, and every clone is the same progress. `snapshot()` gives the state of the whole job, from whichever tracker in it you call it on.
-- **`NoProgress`** reports nowhere and never cancels.
-- **`Snapshot`** is a plain value for pollers. It has the overall `fraction` (`None` until something is known), the current `step` name with its `done`, `total` and `unit`, the latest `message`, a `messages` counter so a poller can tell a new message from a repeat, and `cancelled`.
-- **`Unit`** is `Items`, `Pages` or `Bytes`. It is a closed set so it can cross plugin boundaries. `Unit::noun()` gives the plural for "3 of 10 pages".
-- **`Cancelled`** is the error ops return when they stop. Callers downcast to it to tell a cancel from a failure.
-- **`Level`** is a message's severity: `Info`, `Warn` or `Error`.
-
-### How a tracker adds up
-
-- A progress's own count fills its span from the start. A child's share starts after that count and after the earlier children's shares.
-- Children add up, so siblings working at once on other threads each move the bar by their share. Use `Tracker::child_tracker` when a child must be owned, for example by a worker thread or a plugin handle.
-- A progress that counts and has children shows whichever is further: its count, or its children plus what its count had covered before them. The bar never moves backwards.
-- Dropping a child finishes its share, so a step that ends early or counts nothing still moves the bar on. A cancelled child doesn't.
-- Cancelling a tracker stops it and its children, not its parent or siblings.
-
-### Implementation notes
-
-The whole job's span is fixed point (`1 << 48`), so concurrent children add up with atomic integer adds rather than locks. Only the "last step" and "latest message" fields take a mutex. A panic while holding one is tolerated, because the data behind it is plain.
+No dependencies beyond `std`; Rust 1.85 or later. The API may change before 1.0.
 
 ## Development
 
 ```sh
-cargo test
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+RUSTFLAGS="--cfg loom" cargo test --locked --release --lib  # model-check concurrent updates
 ```
 
-The tests cover fractions and indeterminate totals, nested children, siblings on threads, non-overlapping concurrent child placement, monotonic bars, drop and cancel semantics, NaN weights, step selection, and messages.
+CI runs these on pushes and pull requests. The example above runs as a doctest.
 
 ## License
 

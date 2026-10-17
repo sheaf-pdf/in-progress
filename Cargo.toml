@@ -2,7 +2,17 @@
 name = "in-progress"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Progress reporting and cancellation for long-running operations"
+repository = "https://github.com/gechelberger/in-progress"
+keywords = ["progress", "cancellation", "progress-bar", "cancel"]
+categories = ["concurrency"]
 
 [dependencies]
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
