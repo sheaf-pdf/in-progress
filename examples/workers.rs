@@ -1,10 +1,11 @@
 //! A pool of worker threads, each job with a tracker of its own, and one job
 //! cancelled while the rest carry on.
 //!
-//! `Progress::child` borrows its parent, which suits scoped threads. Threads
-//! started with `std::thread::spawn` need handles they own, so each job gets
-//! a `Tracker::child_tracker`. They're made up front, so the shares sit in
-//! job order whichever worker picks a job up. Partway through, a supervisor
+//! Each job gets a `Tracker::child_tracker` rather than a `Progress::child`:
+//! the supervisor keeps a clone of one job's tracker and cancels just that
+//! job, and a boxed `Progress` can be neither cloned nor cancelled. They're
+//! made up front, so the shares sit in job order whichever worker picks a job
+//! up. Partway through, a supervisor
 //! cancels the biggest job. Only that job stops, and its share is left
 //! unfinished, so the bar ends short of 100%.
 //!
@@ -56,7 +57,7 @@ fn main() {
         .map(|&(name, size)| Job {
             name,
             size,
-            progress: tracker.child_tracker(name, size as f32 / total as f32),
+            progress: tracker.child_tracker(name, size as f64 / total as f64),
         })
         .collect();
 

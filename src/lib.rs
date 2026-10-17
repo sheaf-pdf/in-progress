@@ -158,6 +158,12 @@ pub enum Level {
 /// it in its own error type. To tell a cancel from a failure, match the
 /// variant that wraps it, or use `downcast_ref::<Cancelled>()` on a boxed
 /// error.
+///
+/// In a function that returns [`std::io::Result`], `p.check()?` turns it into
+/// an [`io::Error`](std::io::Error) of kind `Other`, which
+/// `err.get_ref().is_some_and(|e| e.is::<Cancelled>())` recognizes. Don't map
+/// it to `ErrorKind::Interrupted` instead: `read_exact` and `io::copy` retry
+/// those, and since a cancel is permanent they would retry forever.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Cancelled;
 
@@ -168,6 +174,12 @@ impl std::fmt::Display for Cancelled {
 }
 
 impl std::error::Error for Cancelled {}
+
+impl From<Cancelled> for std::io::Error {
+    fn from(cancelled: Cancelled) -> Self {
+        std::io::Error::other(cancelled)
+    }
+}
 
 /// Progress reporting and cooperative cancellation for an operation.
 ///
@@ -205,10 +217,8 @@ pub trait Progress: Send + Sync {
     /// shares. It is cancelled whenever this one is. Dropping it finishes its
     /// share, unless it was cancelled.
     ///
-    /// The box borrows this progress but is `Send`, so an operation can move
-    /// children into [`std::thread::scope`] threads. A caller that owns a
-    /// [`Tracker`] and needs a `'static` handle uses
-    /// [`Tracker::child_tracker`].
+    /// The child is owned and `Send`, so an operation can move it into a
+    /// spawned thread or task, and this progress's share waits for it.
     ///
     /// ```
     /// use in_progress::{Progress, Tracker, Unit};
@@ -226,7 +236,7 @@ pub trait Progress: Send + Sync {
     /// assert_eq!(tracker.snapshot().fraction, Some(0.5));
     /// ```
     #[must_use = "dropping a child immediately finishes its share"]
-    fn child(&self, name: &str, weight: f32) -> Box<dyn Progress + '_>;
+    fn child(&self, name: &str, weight: f64) -> Box<dyn Progress>;
 }
 
 /// Reports nowhere and never cancels.
@@ -241,8 +251,34 @@ impl Progress for NoProgress {
     fn is_cancelled(&self) -> bool {
         false
     }
-    fn child(&self, _: &str, _: f32) -> Box<dyn Progress + '_> {
+    fn child(&self, _: &str, _: f64) -> Box<dyn Progress> {
         Box::new(NoProgress)
+    }
+}
+
+/// Forwards to the referenced progress, so generic code that takes
+/// `impl Progress` accepts the `&dyn Progress` an operation holds.
+impl<P: Progress + ?Sized> Progress for &P {
+    fn set_total(&self, total: Option<u64>, unit: Unit) {
+        (**self).set_total(total, unit);
+    }
+    fn set(&self, done: u64) {
+        (**self).set(done);
+    }
+    fn inc(&self, n: u64) {
+        (**self).inc(n);
+    }
+    fn message(&self, level: Level, msg: &str) {
+        (**self).message(level, msg);
+    }
+    fn is_cancelled(&self) -> bool {
+        (**self).is_cancelled()
+    }
+    fn check(&self) -> Result<(), Cancelled> {
+        (**self).check()
+    }
+    fn child(&self, name: &str, weight: f64) -> Box<dyn Progress> {
+        (**self).child(name, weight)
     }
 }
 
@@ -267,7 +303,7 @@ impl<P: Progress + ?Sized> Progress for Box<P> {
     fn check(&self) -> Result<(), Cancelled> {
         (**self).check()
     }
-    fn child(&self, name: &str, weight: f32) -> Box<dyn Progress + '_> {
+    fn child(&self, name: &str, weight: f64) -> Box<dyn Progress> {
         (**self).child(name, weight)
     }
 }
@@ -297,9 +333,9 @@ pub struct Snapshot {
     pub unit: Unit,
     /// The latest message from anywhere in the job.
     pub message: Option<(Level, String)>,
-    /// How many messages there have been, so a poller can tell a new
-    /// message from a repeat of the last one.
-    pub messages: u64,
+    /// How many messages there have been. When it changes, the message is
+    /// new; a jump of more than one means some were replaced before the poll.
+    pub message_count: u64,
     /// Whether the whole job was cancelled. Cancelling only a child doesn't
     /// set it.
     pub cancelled: bool,
@@ -332,7 +368,7 @@ struct Node {
     /// updates can land out of order and dip below zero for a moment.
     children: AtomicI64,
     /// How much of the span is done, as last added to the parent's
-    /// `children`.
+    /// `children`. The root doesn't keep it.
     filled: AtomicU64,
 }
 
@@ -407,10 +443,19 @@ impl Node {
     ///
     /// The fences order everything else, so the other accesses are relaxed.
     /// The loom tests at the end of this file check each of these steps.
+    ///
+    /// The root is left out: a snapshot works its progress out when it's
+    /// taken, so threads reporting at once don't all contend on it.
     fn refresh(&self) {
+        if self.parent.is_none() {
+            return;
+        }
         let mut node = self;
         fence(SeqCst);
         loop {
+            let Some(parent) = &node.parent else {
+                return;
+            };
             let mut old = node.filled.load(Relaxed);
             let mut moved = false;
             loop {
@@ -423,9 +468,7 @@ impl Node {
                     .compare_exchange_weak(old, new, Relaxed, Relaxed)
                 {
                     Ok(_) => {
-                        if let Some(parent) = &node.parent {
-                            parent.children.fetch_add(new as i64 - old as i64, Relaxed);
-                        }
+                        parent.children.fetch_add(new as i64 - old as i64, Relaxed);
                         moved = true;
                         old = new;
                         fence(SeqCst);
@@ -434,23 +477,23 @@ impl Node {
                 }
             }
             // Whoever moved `filled` carries the change to the parent.
-            match &node.parent {
-                Some(parent) if moved => node = parent,
-                _ => return,
+            if !moved {
+                return;
             }
+            node = parent;
         }
     }
 
     /// Reserve the next `weight` of this span for a child: after the count
     /// and after the earlier children, never overlapping one made at the
     /// same moment on another thread.
-    fn place(&self, weight: f32) -> (u64, u64) {
+    fn place(&self, weight: f64) -> (u64, u64) {
         let weight = if weight.is_nan() {
             0.0
         } else {
             weight.clamp(0.0, 1.0)
         };
-        let len = (f64::from(weight) * self.span() as f64) as u64;
+        let len = (weight * self.span() as f64) as u64;
         let mut next = self.next.load(Relaxed);
         loop {
             let lo = (self.lo + self.counted()).max(next).min(self.hi);
@@ -580,8 +623,8 @@ impl Tracker {
         }))
     }
 
-    /// [`Progress::child`] as an owned `Tracker`, for a holder that can't
-    /// borrow this one, such as a thread started with [`std::thread::spawn`].
+    /// [`Progress::child`] as a `Tracker`, for a holder that wants to clone
+    /// it, cancel it on its own, or take snapshots from it.
     ///
     /// ```
     /// use in_progress::{Progress, Tracker, Unit};
@@ -600,7 +643,7 @@ impl Tracker {
     /// assert_eq!(tracker.snapshot().fraction, Some(1.0));
     /// ```
     #[must_use = "dropping a child immediately finishes its share"]
-    pub fn child_tracker(&self, name: &str, weight: f32) -> Tracker {
+    pub fn child_tracker(&self, name: &str, weight: f64) -> Tracker {
         let parent = &self.0.node;
         let (lo, hi) = parent.place(weight);
         Tracker(Arc::new(Handle {
@@ -632,18 +675,20 @@ impl Tracker {
         let shared = &self.0.shared;
         let root = &shared.root;
         let last = lock(&shared.last).clone();
-        let (messages, message) = lock(&shared.message).clone();
+        let (message_count, message) = lock(&shared.message).clone();
         Snapshot {
+            // Shares are rounded down to whole `ONE`ths, so a finished job
+            // can be a few of them short; rounding to `f32` makes it 1.
             fraction: shared
                 .known
                 .load(Relaxed)
-                .then(|| (root.filled.load(Relaxed) as f64 / ONE as f64) as f32),
+                .then(|| (root.progress() as f64 / ONE as f64) as f32),
             step: last.name.clone(),
             done: last.done.load(Relaxed),
             total: last.total(),
             unit: *lock(&last.unit),
             message,
-            messages,
+            message_count,
             cancelled: root.cancelled.load(Relaxed),
         }
     }
@@ -694,7 +739,7 @@ impl Progress for Tracker {
         self.0.node.is_cancelled()
     }
 
-    fn child(&self, name: &str, weight: f32) -> Box<dyn Progress + '_> {
+    fn child(&self, name: &str, weight: f64) -> Box<dyn Progress> {
         Box::new(self.child_tracker(name, weight))
     }
 }
@@ -800,6 +845,57 @@ mod tests {
     }
 
     #[test]
+    fn a_borrowed_progress_is_a_progress() {
+        fn step(p: impl Progress) {
+            p.set_total(Some(2), Unit::ITEMS);
+            p.inc(1);
+        }
+        let t = Tracker::new();
+        let p: &dyn Progress = &t;
+        step(p);
+        assert_eq!(frac(&t), 0.5);
+    }
+
+    #[test]
+    fn a_child_can_go_to_a_spawned_thread() {
+        fn op(p: &dyn Progress) -> std::thread::JoinHandle<()> {
+            let child = p.child("background", 0.5);
+            std::thread::spawn(move || {
+                child.set_total(Some(2), Unit::ITEMS);
+                child.inc(1);
+            })
+        }
+        let t = Tracker::new();
+        op(&t).join().unwrap();
+        // The child was dropped on its thread, finishing its share.
+        assert_eq!(frac(&t), 0.5);
+    }
+
+    #[test]
+    fn equal_weights_fill_the_bar() {
+        for n in 2..=1000 {
+            let t = Tracker::new();
+            for i in 0..n {
+                drop(t.child(&format!("step {i}"), 1.0 / n as f64));
+            }
+            assert_eq!(t.snapshot().fraction, Some(1.0), "{n} steps");
+        }
+    }
+
+    #[test]
+    fn a_cancel_becomes_an_io_error() {
+        fn copy(p: &dyn Progress) -> std::io::Result<()> {
+            p.check()?;
+            Ok(())
+        }
+        let t = Tracker::new();
+        t.cancel();
+        let err = copy(&t).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(err.get_ref().is_some_and(|e| e.is::<Cancelled>()));
+    }
+
+    #[test]
     fn siblings_at_once_add_up() {
         let t = Tracker::new();
         let a = t.child_tracker("a", 0.5);
@@ -816,40 +912,51 @@ mod tests {
         assert_eq!(frac(&t), 1.0);
     }
 
+    // The root works its progress out at snapshot time, so the threaded tests
+    // race under a `job` child that covers the whole bar. They stop at half,
+    // where the clamp at a full share can't hide a count added twice.
+
     #[test]
     fn siblings_on_threads_add_up() {
         let t = Tracker::new();
+        let job = t.child_tracker("job", 1.0);
         let steps: Vec<Tracker> = (0..8)
-            .map(|i| t.child_tracker(&format!("worker {i}"), 1.0 / 8.0))
+            .map(|i| job.child_tracker(&format!("worker {i}"), 1.0 / 8.0))
             .collect();
+        let start = std::sync::Barrier::new(steps.len());
         std::thread::scope(|s| {
             for step in &steps {
+                let start = &start;
                 s.spawn(move || {
-                    step.set_total(Some(1000), Unit::ITEMS);
+                    step.set_total(Some(2000), Unit::ITEMS);
+                    start.wait();
                     for _ in 0..1000 {
                         step.inc(1);
                     }
                 });
             }
         });
-        // The steps are still alive, so only their counts can fill the bar.
-        assert_eq!(frac(&t), 1.0);
+        // The steps are still alive, so only their counts can move the bar.
+        assert_eq!(frac(&t), 0.5);
     }
 
     #[test]
     fn clones_on_threads_add_up() {
         let t = Tracker::new();
-        t.set_total(Some(8000), Unit::ITEMS);
+        let job = t.child_tracker("job", 1.0);
+        job.set_total(Some(16000), Unit::ITEMS);
+        let start = std::sync::Barrier::new(8);
         std::thread::scope(|s| {
             for _ in 0..8 {
                 s.spawn(|| {
+                    start.wait();
                     for _ in 0..1000 {
-                        t.inc(1);
+                        job.inc(1);
                     }
                 });
             }
         });
-        assert_eq!((t.snapshot().done, frac(&t)), (8000, 1.0));
+        assert_eq!((t.snapshot().done, frac(&t)), (8000, 0.5));
     }
 
     #[test]
@@ -1006,7 +1113,7 @@ mod tests {
     #[test]
     fn nan_weight_gets_nothing() {
         let t = Tracker::new();
-        let nan = t.child_tracker("nan", f32::NAN);
+        let nan = t.child_tracker("nan", f64::NAN);
         assert_eq!(nan.0.node.span(), 0);
         let rest = t.child_tracker("rest", 0.5);
         assert_eq!((rest.0.node.lo, rest.0.node.hi), (0, ONE / 2));
@@ -1040,7 +1147,7 @@ mod tests {
         );
         // A repeat still counts as a new message.
         t.message(Level::Warn, "skipped 1 file");
-        assert_eq!(t.snapshot().messages, 2);
+        assert_eq!(t.snapshot().message_count, 2);
         assert!(Level::Error > Level::Warn && Level::Warn > Level::Info);
     }
 
@@ -1052,7 +1159,10 @@ mod tests {
     }
 }
 
-/// Model checks of the lock-free updates, run with `just loom`.
+/// Model checks of the lock-free updates, run with
+/// `RUSTFLAGS="--cfg loom" cargo test --release --lib`. The root works its
+/// progress out at snapshot time, so each race runs under a `job` child that
+/// covers the whole bar.
 #[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
@@ -1075,8 +1185,9 @@ mod loom_tests {
     fn siblings_on_threads_add_up() {
         loom::model(|| {
             let t = Tracker::new();
-            let a = t.child_tracker("a", 0.5);
-            let b = t.child_tracker("b", 0.5);
+            let job = t.child_tracker("job", 1.0);
+            let a = job.child_tracker("a", 0.5);
+            let b = job.child_tracker("b", 0.5);
             a.set_total(Some(1), Unit::ITEMS);
             b.set_total(Some(1), Unit::ITEMS);
             let other = spawn_with(&a, |a| a.inc(1));
@@ -1090,9 +1201,10 @@ mod loom_tests {
     fn clones_on_threads_add_up() {
         loom::model(|| {
             let t = Tracker::new();
-            t.set_total(Some(2), Unit::ITEMS);
-            let other = spawn_with(&t, |t| t.inc(1));
-            t.inc(1);
+            let job = t.child_tracker("job", 1.0);
+            job.set_total(Some(2), Unit::ITEMS);
+            let other = spawn_with(&job, |job| job.inc(1));
+            job.inc(1);
             other.join().unwrap();
             assert_eq!(fraction(&t), Some(1.0));
         });
@@ -1102,8 +1214,9 @@ mod loom_tests {
     fn a_total_and_a_count_set_at_once_both_count() {
         loom::model(|| {
             let t = Tracker::new();
-            let other = spawn_with(&t, |t| t.set_total(Some(1), Unit::ITEMS));
-            t.inc(1);
+            let job = t.child_tracker("job", 1.0);
+            let other = spawn_with(&job, |job| job.set_total(Some(1), Unit::ITEMS));
+            job.inc(1);
             other.join().unwrap();
             assert_eq!(fraction(&t), Some(1.0));
         });
@@ -1113,10 +1226,11 @@ mod loom_tests {
     fn a_total_and_a_count_that_cancel_out() {
         loom::model(|| {
             let t = Tracker::new();
-            t.set_total(Some(8), Unit::ITEMS);
-            t.set(7);
-            let other = spawn_with(&t, |t| t.set_total(Some(16), Unit::ITEMS));
-            t.inc(7);
+            let job = t.child_tracker("job", 1.0);
+            job.set_total(Some(8), Unit::ITEMS);
+            job.set(7);
+            let other = spawn_with(&job, |job| job.set_total(Some(16), Unit::ITEMS));
+            job.inc(7);
             other.join().unwrap();
             assert_eq!(fraction(&t), Some(0.875));
         });
@@ -1126,10 +1240,11 @@ mod loom_tests {
     fn a_full_bar_whose_total_and_count_grow() {
         loom::model(|| {
             let t = Tracker::new();
-            t.set_total(Some(8), Unit::ITEMS);
-            t.set(8);
-            let other = spawn_with(&t, |t| t.set_total(Some(16), Unit::ITEMS));
-            t.inc(8);
+            let job = t.child_tracker("job", 1.0);
+            job.set_total(Some(8), Unit::ITEMS);
+            job.set(8);
+            let other = spawn_with(&job, |job| job.set_total(Some(16), Unit::ITEMS));
+            job.inc(8);
             other.join().unwrap();
             assert_eq!(fraction(&t), Some(1.0));
         });
@@ -1139,12 +1254,13 @@ mod loom_tests {
     fn a_parent_total_races_a_child_count() {
         loom::model(|| {
             let t = Tracker::new();
-            t.set_total(Some(8), Unit::ITEMS);
-            let c = t.child_tracker("c", 0.5);
+            let job = t.child_tracker("job", 1.0);
+            job.set_total(Some(8), Unit::ITEMS);
+            let c = job.child_tracker("c", 0.5);
             c.set_total(Some(1), Unit::ITEMS);
-            t.set(7);
+            job.set(7);
             let other = spawn_with(&c, |c| c.inc(1));
-            t.set_total(Some(16), Unit::ITEMS);
+            job.set_total(Some(16), Unit::ITEMS);
             other.join().unwrap();
             // The child's half beats the count's 7/16.
             assert_eq!(fraction(&t), Some(0.5));
@@ -1155,11 +1271,12 @@ mod loom_tests {
     fn a_parent_total_races_a_child_finishing() {
         loom::model(|| {
             let t = Tracker::new();
-            t.set_total(Some(8), Unit::ITEMS);
-            let c = t.child_tracker("c", 0.5);
-            t.set(7);
+            let job = t.child_tracker("job", 1.0);
+            job.set_total(Some(8), Unit::ITEMS);
+            let c = job.child_tracker("c", 0.5);
+            job.set(7);
             let other = thread::spawn(move || drop(c));
-            t.set_total(Some(16), Unit::ITEMS);
+            job.set_total(Some(16), Unit::ITEMS);
             other.join().unwrap();
             assert_eq!(fraction(&t), Some(0.5));
         });
@@ -1169,12 +1286,13 @@ mod loom_tests {
     fn a_parent_count_lowered_while_a_child_counts() {
         loom::model(|| {
             let t = Tracker::new();
-            t.set_total(Some(8), Unit::ITEMS);
-            let c = t.child_tracker("c", 0.5);
+            let job = t.child_tracker("job", 1.0);
+            job.set_total(Some(8), Unit::ITEMS);
+            let c = job.child_tracker("c", 0.5);
             c.set_total(Some(1), Unit::ITEMS);
-            t.set(7);
+            job.set(7);
             let other = spawn_with(&c, |c| c.inc(1));
-            t.set(1);
+            job.set(1);
             other.join().unwrap();
             assert_eq!(fraction(&t), Some(0.5));
         });
@@ -1184,8 +1302,9 @@ mod loom_tests {
     fn siblings_finish_at_once() {
         loom::model(|| {
             let t = Tracker::new();
-            let a = t.child_tracker("a", 0.5);
-            let b = t.child_tracker("b", 0.5);
+            let job = t.child_tracker("job", 1.0);
+            let a = job.child_tracker("a", 0.5);
+            let b = job.child_tracker("b", 0.5);
             let other = thread::spawn(move || drop(a));
             drop(b);
             other.join().unwrap();
@@ -1214,14 +1333,15 @@ mod loom_tests {
     fn placing_a_child_races_a_lowered_count() {
         loom::model(|| {
             let t = Tracker::new();
-            t.set_total(Some(2), Unit::ITEMS);
-            t.set(1);
-            let other = spawn_with(&t, |t| {
-                let c = t.child_tracker("c", 0.5);
+            let job = t.child_tracker("job", 1.0);
+            job.set_total(Some(2), Unit::ITEMS);
+            job.set(1);
+            let other = spawn_with(&job, |job| {
+                let c = job.child_tracker("c", 0.5);
                 c.cancel(); // Keep its share open.
                 c
             });
-            t.set(0);
+            job.set(0);
             let c = other.join().unwrap();
             // Placed after the count, the gap before it stays done.
             if c.0.node.lo == ONE / 2 {

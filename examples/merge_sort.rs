@@ -78,7 +78,7 @@ fn merge_sort(
     let mid = n / 2;
     let at_once = level < PARALLEL_LEVELS;
     let whole = time(n, level);
-    let share = |len| ((if at_once { 0.5 } else { 1.0 }) * time(len, level + 1) / whole) as f32;
+    let share = |len| (if at_once { 0.5 } else { 1.0 }) * time(len, level + 1) / whole;
     let left = p.child(&format!("sort {start}..{}", start + mid), share(mid));
     let right = p.child(
         &format!("sort {}..{}", start + mid, start + n),

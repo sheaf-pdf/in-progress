@@ -51,6 +51,22 @@ jobs:
       - name: Build and lint with --cfg loom
         run: just loom-lint
 
+  # The atomics are relaxed and ordered by fences. x86 orders memory more
+  # strictly than the language promises, so run the tests where it doesn't.
+  arm64:
+    name: Tests on arm64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: extractions/setup-just@v4
+      - name: Test
+        run: just test
+      - name: Test optimized
+        run: just test-release
+
   msrv:
     name: Minimum Rust version
     runs-on: ubuntu-latest
