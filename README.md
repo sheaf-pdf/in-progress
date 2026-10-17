@@ -60,6 +60,7 @@ Each one draws a live progress line and takes a few seconds:
 - `cargo run --example cancel`: a job of three steps. Press Enter to cancel it, and `Err(Cancelled)` comes back up through each step.
 - `cargo run --example workers`: a pool of `thread::spawn` workers, each job with an owned `child_tracker`. One job is cancelled while the rest finish.
 - `cargo run --example custom_progress -- [time limit in ms]`: implementing `Progress` yourself, as a log that prints the tree of steps and cancels at a deadline. The same job also runs with `NoProgress`.
+- `cargo run --example rayon_pipeline`: progress from rayon's parallel iterators with no adapter, using `inspect`. Thumbnails go through three `map` stages, each counted into a child weighted by its cost. A search counts records checked before `find_any`, which stops early.
 
 ## Status
 

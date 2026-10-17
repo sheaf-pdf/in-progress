@@ -39,6 +39,7 @@ examples:
     cargo run --locked --example cancel < /dev/null
     cargo run --locked --example workers
     cargo run --locked --example custom_progress
+    cargo run --locked --example rayon_pipeline
 
 # Model-check the concurrent updates with loom.
 loom:
