@@ -81,7 +81,7 @@ impl Progress for Log {
         Instant::now() >= self.deadline
     }
 
-    fn child(&self, name: &str, weight: f32) -> Box<dyn Progress + '_> {
+    fn child(&self, name: &str, weight: f64) -> Box<dyn Progress> {
         self.print(&format!("{name} ({:.0}%)", weight * 100.0));
         Box::new(Log::new(self.depth + 1, self.deadline))
     }
@@ -112,7 +112,7 @@ fn build(p: &dyn Progress) -> Result<(), Cancelled> {
     let compile = p.child("compile", 0.8);
     let units: u64 = CRATES.iter().map(|&(_, n)| n).sum();
     for (name, n) in CRATES {
-        steps(&compile.child(name, n as f32 / units as f32), n, "units")?;
+        steps(&compile.child(name, n as f64 / units as f64), n, "units")?;
     }
     drop(compile);
     steps(&p.child("link", 0.1), 5, "objects")?;

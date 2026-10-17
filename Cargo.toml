@@ -8,6 +8,8 @@ description = "Progress reporting and cancellation for long-running operations"
 repository = "https://github.com/gechelberger/in-progress"
 keywords = ["progress", "cancellation", "progress-bar", "cancel"]
 categories = ["concurrency"]
+# Only what users need, so local tooling files can't end up in the package.
+include = ["/src", "/examples", "/README.md", "/LICENSE-*"]
 
 [dependencies]
 

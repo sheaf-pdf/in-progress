@@ -9,7 +9,7 @@ default:
     @just --list --unsorted
 
 # Everything CI runs.
-ci: fmt clippy test doc examples loom loom-lint msrv
+ci: fmt clippy test test-release doc examples loom loom-lint msrv
 
 # Check formatting; `cargo fmt --all` fixes it.
 fmt:
@@ -22,6 +22,10 @@ clippy:
 # Unit tests and doctests, building the examples too.
 test:
     cargo test --locked
+
+# The tests again, optimized, so the compiler reorders what it may.
+test-release:
+    cargo test --locked --release
 
 # Build the API docs, failing on warnings.
 doc:
