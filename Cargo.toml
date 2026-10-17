@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Progress reporting and cancellation for long-running operations"
-repository = "https://github.com/gechelberger/in-progress"
+repository = "https://github.com/sheaf-pdf/in-progress"
 keywords = ["progress", "cancellation", "progress-bar", "cancel"]
 categories = ["concurrency"]
 # Only what users need, so local tooling files can't end up in the package.
