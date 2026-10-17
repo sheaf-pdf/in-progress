@@ -1,5 +1,11 @@
 # in-progress
 
+[![crates.io](https://img.shields.io/crates/v/in-progress.svg)](https://crates.io/crates/in-progress)
+[![docs.rs](https://img.shields.io/docsrs/in-progress)](https://docs.rs/in-progress)
+[![CI](https://github.com/sheaf-pdf/in-progress/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sheaf-pdf/in-progress/actions/workflows/ci.yml?query=branch%3Amain)
+[![MSRV](https://img.shields.io/crates/msrv/in-progress.svg)](#status)
+[![License](https://img.shields.io/crates/l/in-progress.svg)](#license)
+
 Progress reporting and cooperative cancellation for long-running operations, in one small Rust crate with no dependencies.
 
 An operation takes a `&dyn Progress`, says how far along it is, and calls `check()?` between units of work so a cancel stops it cleanly. Whoever runs it holds a `Tracker`: it polls a `Snapshot` from another thread to draw a progress bar or a status line, and can cancel at any time. Callers that don't care pass `NoProgress`.
