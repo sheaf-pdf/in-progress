@@ -13,6 +13,10 @@ include = ["/src", "/examples", "/README.md", "/LICENSE-*"]
 
 [dependencies]
 
+[dev-dependencies]
+# For the rayon_pipeline example.
+rayon = "1.12"
+
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"
 
