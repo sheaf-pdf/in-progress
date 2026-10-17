@@ -52,21 +52,30 @@ Calling `tracker.cancel()` from any thread stops the job: its next `check()` ret
 
 The [API documentation](https://docs.rs/in-progress) covers how shares add up, threads, and cancellation.
 
+## Examples
+
+Each one draws a live progress line and takes a few seconds:
+
+- `cargo run --example merge_sort -- [len]`: a merge sort that gives each half of the problem, and the merge that joins them, a weighted child. The top levels sort on scoped threads, so sibling shares fill at once.
+- `cargo run --example cancel`: a job of three steps. Press Enter to cancel it, and `Err(Cancelled)` comes back up through each step.
+- `cargo run --example workers`: a pool of `thread::spawn` workers, each job with an owned `child_tracker`. One job is cancelled while the rest finish.
+- `cargo run --example custom_progress -- [time limit in ms]`: implementing `Progress` yourself, as a log that prints the tree of steps and cancels at a deadline. The same job also runs with `NoProgress`.
+
 ## Status
 
 No dependencies beyond `std`; Rust 1.85 or later. The API may change before 1.0.
 
 ## Development
 
+The checks are recipes in the [justfile](justfile), run with [just](https://github.com/casey/just):
+
 ```sh
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
-RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
-RUSTFLAGS="--cfg loom" cargo test --locked --release --lib  # model-check concurrent updates
+just          # list the recipes
+just ci       # run everything CI runs
+just loom     # or one at a time
 ```
 
-CI runs these on pushes and pull requests. The example above runs as a doctest.
+CI runs the same recipes on pushes and pull requests. The example above runs as a doctest.
 
 ## License
 

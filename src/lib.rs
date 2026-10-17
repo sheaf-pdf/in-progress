@@ -1052,8 +1052,7 @@ mod tests {
     }
 }
 
-/// Model checks of the lock-free updates, run with
-/// `RUSTFLAGS="--cfg loom" cargo test --release --lib`.
+/// Model checks of the lock-free updates, run with `just loom`.
 #[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;

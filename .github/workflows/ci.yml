@@ -10,6 +10,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Each step runs a recipe from the justfile, so `just ci` locally checks the
+# same things.
 jobs:
   check:
     name: Rust checks
@@ -21,16 +23,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: extractions/setup-just@v4
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: just fmt
       - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: just clippy
       - name: Test (including doctests)
-        run: cargo test --locked
+        run: just test
       - name: Build documentation
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --no-deps
+        run: just doc
+      - name: Run examples
+        run: just examples
 
   loom:
     name: Loom model checks
@@ -42,18 +45,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - uses: extractions/setup-just@v4
       - name: Model-check concurrent updates
-        env:
-          RUSTFLAGS: --cfg loom
-        run: cargo test --locked --release --lib
-      # Projects that model-check their own code build their dependencies with
-      # --cfg loom too, so the library has to build that way without loom.
+        run: just loom
       - name: Build and lint with --cfg loom
-        env:
-          RUSTFLAGS: --cfg loom
-        run: |
-          cargo check --locked --lib
-          cargo clippy --locked --release --all-targets -- -D warnings
+        run: just loom-lint
 
   msrv:
     name: Minimum Rust version
@@ -62,6 +58,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      # Keep in step with rust-version in Cargo.toml, which `just msrv` reads.
       - uses: dtolnay/rust-toolchain@1.85
+      - uses: extractions/setup-just@v4
       - name: Test
-        run: cargo test --locked
+        run: just msrv
