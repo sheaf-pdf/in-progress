@@ -94,6 +94,16 @@
 //!
 //! The fraction can go down when a count is lowered, a total is raised, or a
 //! total becomes unknown.
+//!
+//! # Scope
+//!
+//! The crate carries progress, messages and cancellation between an
+//! operation and whoever runs it; it doesn't display them. There are no
+//! progress bars, spinners, formatting or colors here, and there won't be.
+//! A [`Snapshot`] has what a renderer needs, and crates such as
+//! [indicatif](https://docs.rs/indicatif) already draw bars.
+//! Adapters for reporting from iterators or rayon would fit, if there's a
+//! need for them.
 
 #![warn(missing_docs, missing_debug_implementations)]
 

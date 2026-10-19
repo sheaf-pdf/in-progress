@@ -1,87 +1,77 @@
-//! The progress line the examples draw while their job runs.
+//! Draws a job's progress with indicatif while it runs.
+//!
+//! in-progress tracks a job but doesn't draw it. This is the glue: a loop
+//! that polls the tracker's snapshot and copies it into an indicatif bar.
 
 use in_progress::{Snapshot, Tracker, Unit};
+use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use std::{
-    io::{IsTerminal, Write},
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-const WIDTH: usize = 24;
+/// The bar's length, so the fraction is shown in thousandths.
+const LEN: u64 = 1000;
 
 /// Draws `tracker`'s progress until `job` finishes, then returns its result.
 ///
-/// On a terminal the line is redrawn in place; when the output is piped, a
-/// plain line is printed every half second instead.
+/// indicatif hides the bar when stderr isn't a terminal, but messages are
+/// still printed.
 pub fn watch<T>(tracker: &Tracker, job: JoinHandle<T>) -> T {
-    let tty = std::io::stdout().is_terminal();
-    let mut polls = 0;
-    while !job.is_finished() {
-        if tty || polls % 10 == 0 {
-            draw(&tracker.snapshot(), tty);
+    let bar = ProgressBar::new(LEN).with_style(style("{spinner} {msg}"));
+    bar.enable_steady_tick(Duration::from_millis(100));
+    let mut known = false;
+    let mut messages = 0;
+    loop {
+        let finished = job.is_finished();
+        let s = tracker.snapshot();
+        // A spinner until the fraction is known; once known, it stays known.
+        if let Some(fraction) = s.fraction {
+            if !known {
+                bar.set_style(style("{bar:24} {percent:>3}%  {msg}"));
+                known = true;
+            }
+            bar.set_position((fraction * LEN as f32).round() as u64);
         }
-        polls += 1;
+        bar.set_message(status(&s));
+        // The snapshot keeps only the latest message, so a jump of more than
+        // one means some were replaced between polls.
+        if s.message_count > messages {
+            if let Some((level, msg)) = &s.message {
+                bar.suspend(|| eprintln!("{level:?}: {msg}"));
+            }
+            messages = s.message_count;
+        }
+        if finished {
+            break;
+        }
         thread::sleep(Duration::from_millis(50));
     }
-    draw(&tracker.snapshot(), tty);
-    if tty {
-        println!();
-    }
+    // Leaves the bar where the job left it: `finish` would fill it, even
+    // after a cancelled step.
+    bar.abandon();
     job.join().unwrap_or_else(|e| std::panic::resume_unwind(e))
 }
 
-fn draw(s: &Snapshot, tty: bool) {
-    let fraction = s.fraction.unwrap_or(0.0);
-    let filled = (fraction * WIDTH as f32).round() as usize;
-    let mut line = format!(
-        "[{}{}] {:>3.0}%",
-        "#".repeat(filled),
-        "·".repeat(WIDTH - filled),
-        fraction * 100.0
-    );
-    if !s.step.is_empty() {
-        line += &format!("  {}", s.step);
-    }
-    let noun = match s.unit {
-        Unit::Count(noun) => format!(" {noun}"),
-        Unit::Bytes => String::new(),
-    };
-    let done = amount(s.done, s.unit);
-    match s.total {
-        Some(total) => line += &format!("  {done}/{}{noun}", amount(total, s.unit)),
-        None if s.done > 0 => line += &format!("  {done}{noun}"),
-        None => {}
-    }
-    if let Some((level, msg)) = &s.message {
-        line += &format!("  ({level:?}: {msg})");
-    }
-    let mut out = std::io::stdout().lock();
-    if tty {
-        // Back to the start of the line and clear it.
-        write!(out, "\r\x1b[2K{line}").unwrap();
-    } else {
-        writeln!(out, "{line}").unwrap();
-    }
-    out.flush().unwrap();
+fn style(template: &str) -> ProgressStyle {
+    ProgressStyle::with_template(template).expect("a valid template")
 }
 
-/// `n` in `unit`: a plain number for counts, a size for bytes.
-fn amount(n: u64, unit: Unit) -> String {
-    match unit {
+/// The step and its count, such as `copy  1.50 MiB/12.00 MiB` or
+/// `scan  12 files`.
+fn status(s: &Snapshot) -> String {
+    let amount = |n: u64| match s.unit {
         Unit::Count(_) => n.to_string(),
-        Unit::Bytes => {
-            const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
-            let mut size = n as f64;
-            let mut i = 0;
-            while size >= 1024.0 && i < UNITS.len() - 1 {
-                size /= 1024.0;
-                i += 1;
-            }
-            if i == 0 {
-                format!("{n} B")
-            } else {
-                format!("{size:.1} {}", UNITS[i])
-            }
-        }
-    }
+        Unit::Bytes => HumanBytes(n).to_string(),
+    };
+    let count = match s.total {
+        Some(total) => format!("{}/{}", amount(s.done), amount(total)),
+        None if s.done > 0 => amount(s.done),
+        None => return s.step.clone(),
+    };
+    let noun = match s.unit {
+        Unit::Count(noun) => noun,
+        Unit::Bytes => "",
+    };
+    format!("{}  {count} {noun}", s.step).trim().to_owned()
 }

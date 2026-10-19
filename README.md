@@ -60,13 +60,19 @@ The [API documentation](https://docs.rs/in-progress) covers how shares add up, t
 
 ## Examples
 
-Each one draws a live progress line and takes a few seconds:
+Each one takes a few seconds, and all but `custom_progress` draw a live progress bar with [indicatif](https://crates.io/crates/indicatif):
 
 - `cargo run --example merge_sort -- [len]`: a merge sort that gives each half of the problem, and the merge that joins them, a weighted child. The top levels sort on scoped threads, so sibling shares fill at once.
 - `cargo run --example cancel`: a job of three steps. Press Enter to cancel it, and `Err(Cancelled)` comes back up through each step.
 - `cargo run --example workers`: a pool of `thread::spawn` workers, each job with an owned `child_tracker`. One job is cancelled while the rest finish.
 - `cargo run --example custom_progress -- [time limit in ms]`: implementing `Progress` yourself, as a log that prints the tree of steps and cancels at a deadline. The same job also runs with `NoProgress`.
 - `cargo run --example rayon_pipeline`: progress from rayon's parallel iterators with no adapter, using `inspect`. Thumbnails go through three `map` stages, each counted into a child weighted by its cost. A search counts records checked before `find_any`, which stops early.
+
+## Scope
+
+The crate carries three things between an operation and whoever runs it: progress (counts and totals, with steps nested by weight), messages, and cancellation, all safe to use from any thread. What to do with them is up to the caller. The crate has no opinions on display, so it has no progress bars, spinners, formatting or colors, and it won't add them. A `Snapshot` has what a renderer needs, whether that's a terminal bar, a GUI, a log, or a status endpoint. It holds only the latest message; to keep every one, implement `Progress`, as the `custom_progress` example does. The other examples poll the tracker and copy each snapshot into an indicatif bar, in a few lines in [`examples/support`](examples/support/mod.rs).
+
+What would fit is help reporting progress from more kinds of code, such as adapters for iterators or rayon's parallel iterators, if there's a need for them. Until then, `inspect` can count items for either, as the `rayon_pipeline` example does for rayon.
 
 ## Status
 
