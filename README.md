@@ -60,7 +60,7 @@ The [API documentation](https://docs.rs/in-progress) covers how shares add up, t
 
 ## Examples
 
-Each one draws a live progress line and takes a few seconds:
+Each one takes a few seconds, and all but `custom_progress` draw a live progress bar with [indicatif](https://crates.io/crates/indicatif):
 
 - `cargo run --example merge_sort -- [len]`: a merge sort that gives each half of the problem, and the merge that joins them, a weighted child. The top levels sort on scoped threads, so sibling shares fill at once.
 - `cargo run --example cancel`: a job of three steps. Press Enter to cancel it, and `Err(Cancelled)` comes back up through each step.
